@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Build customized WinPE media (ISO / USB). Version 2.0
 
@@ -38,7 +38,7 @@
 #Requires -Version 5.1
 #Requires -RunAsAdministrator
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
     [string]$WorkDirectory,
     [ValidateSet('amd64', 'x86', 'arm64')][string]$Architecture = 'amd64',
@@ -100,7 +100,27 @@ $DefaultPackages = @(
     'WinPE-EnhancedStorage'
 )
 
+# Foundation packages required for PowerShell and WMI execution in WinPE.
+$script:MandatoryFoundationPackages = @(
+    'WinPE-WMI',
+    'WinPE-NetFx',
+    'WinPE-Scripting',
+    'WinPE-PowerShell'
+)
+
 # --- project path / session ---
+
+function Assert-NoCmdMetacharacters {
+    # Reject cmd.exe metacharacters before passing paths or arguments to ADK batch files.
+    param(
+        [string]$Value,
+        [string]$ParameterName = 'Path'
+    )
+    if ([string]::IsNullOrEmpty($Value)) { return }
+    if ($Value -match '[&|<>^%!\r\n]') {
+        throw "Refused $ParameterName containing unsafe cmd.exe metacharacters ([&|<>^%!]): $Value"
+    }
+}
 
 function Test-WinPeProjectRoot {
     param([string]$Path)
@@ -137,41 +157,90 @@ function Resolve-FullPath {
 }
 
 function Assert-SafeWorkDirectory {
-    # Refuse project roots under %WINDIR% / System32 (elevated shells often start there;
-    # a relative path or accidental CWD would create a huge, dangerous tree).
+    # Refuse project roots at drive roots (C:\), user profile root, or under system/program directories
+    # (%WINDIR%, %SystemRoot%, %ProgramFiles%, %ProgramFiles(x86)%, %ProgramData%).
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    Assert-NoCmdMetacharacters -Value $Path -ParameterName 'WorkDirectory'
+
+    $trimmed = $Path.Trim()
+    if ($trimmed -match '^[A-Za-z]:[\\/]?$' -or $trimmed -eq '/' -or $trimmed -eq '\') {
+        throw "Refused WorkDirectory at drive root: $Path"
+    }
+
+    $normInput = $trimmed.Replace('/', '\').TrimEnd('\')
+    $full = $normInput
     try {
-        $full = [IO.Path]::GetFullPath($Path.Trim().TrimEnd('\'))
+        $resolvedFull = [IO.Path]::GetFullPath($trimmed)
+        $pathRoot = [IO.Path]::GetPathRoot($resolvedFull)
+        if ($pathRoot -and $resolvedFull.TrimEnd('\', '/').Equals($pathRoot.TrimEnd('\', '/'), [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refused WorkDirectory at drive root: $resolvedFull"
+        }
+        $full = $resolvedFull.Replace('/', '\').TrimEnd('\')
     }
     catch {
-        return
+        if ($_.Exception.Message -match '^Refused WorkDirectory') { throw }
     }
-    $win = $env:WINDIR
-    if (-not $win) { $win = 'C:\Windows' }
-    $blocked = @(
-        [IO.Path]::GetFullPath($win).TrimEnd('\')
-        [IO.Path]::GetFullPath((Join-Path $win 'System32')).TrimEnd('\')
+
+    if ($env:USERPROFILE) {
+        $userProfNorm = $env:USERPROFILE.Trim().Replace('/', '\').TrimEnd('\')
+        if ($userProfNorm -and (
+                $full.Equals($userProfNorm, [StringComparison]::OrdinalIgnoreCase) -or
+                $normInput.Equals($userProfNorm, [StringComparison]::OrdinalIgnoreCase)
+            )) {
+            throw "Refused WorkDirectory at USERPROFILE root: $Path"
+        }
+    }
+
+    $win = if ($env:SystemRoot) { $env:SystemRoot } elseif ($env:WINDIR) { $env:WINDIR } else { 'C:\Windows' }
+    $rawBlockedPrefixes = @(
+        $win,
+        $env:WINDIR,
+        $env:SystemRoot,
+        'C:\Windows',
+        (Join-Path $win 'System32'),
+        'C:\Windows\System32',
+        $env:ProgramFiles,
+        'C:\Program Files',
+        ${env:ProgramFiles(x86)},
+        'C:\Program Files (x86)',
+        $env:ProgramData,
+        'C:\ProgramData'
     )
+
+    $blocked = New-Object System.Collections.Generic.List[string]
+    foreach ($candidate in $rawBlockedPrefixes) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        $cNorm = $candidate.Trim().Replace('/', '\').TrimEnd('\')
+        if ($cNorm -and -not $blocked.Contains($cNorm)) {
+            [void]$blocked.Add($cNorm)
+        }
+        try {
+            $cFull = [IO.Path]::GetFullPath($candidate).Replace('/', '\').TrimEnd('\')
+            if ($cFull -and -not $blocked.Contains($cFull)) {
+                [void]$blocked.Add($cFull)
+            }
+        }
+        catch { }
+    }
+
     foreach ($b in $blocked) {
-        if ($full.Equals($b, [StringComparison]::OrdinalIgnoreCase) -or
-            $full.StartsWith($b + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            throw @"
-Refused WorkDirectory under Windows or System32:
-  $full
+        foreach ($target in @($full, $normInput)) {
+            if ([string]::IsNullOrWhiteSpace($target)) { continue }
+            if ($target.Equals($b, [StringComparison]::OrdinalIgnoreCase) -or
+                $target.StartsWith($b + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                throw @"
+Refused WorkDirectory under protected system directory ($b):
+  $target
 
 That is not a safe project folder. Elevated PowerShell often starts in System32;
 if the path was relative, it may have resolved there by mistake.
 
-Use a full path outside Windows, for example:
+Use a dedicated project path outside system folders, for example:
 
   .\WinPE-Builder.ps1 -Init -WorkDirectory C:\MyWinPE-Project
-
-Or change directory first, then use a relative path:
-
-  cd D:\Projects
-  .\WinPE-Builder.ps1 -Init -WorkDirectory .\MyWinPE-Project
 "@
+            }
         }
     }
 }
@@ -218,6 +287,9 @@ $resolved = Resolve-WorkDirectoryPath `
 $WorkDirectory = $resolved.Path
 $script:WorkDirectorySource = $resolved.Source
 Assert-SafeWorkDirectory -Path $WorkDirectory
+if ($BootWimPath) {
+    Assert-NoCmdMetacharacters -Value $BootWimPath -ParameterName 'BootWimPath'
+}
 Set-SessionWorkDirectory -Path $WorkDirectory
 
 # Project layout
@@ -231,10 +303,15 @@ $DirMedia = Join-Path $DirPeRoot 'media'
 $DirLogs = Join-Path $WorkDirectory 'WinPE-Logs'
 $FileBootWim = Join-Path $DirPeRoot 'media\sources\boot.wim'
 
-if (-not (Test-Path $DirLogs)) {
-    New-Item -ItemType Directory -Path $DirLogs -Force | Out-Null
+if (-not $WhatIfPreference) {
+    if (-not (Test-Path -LiteralPath $DirLogs)) {
+        New-Item -ItemType Directory -Path $DirLogs -Force | Out-Null
+    }
+    $script:LogFile = Join-Path $DirLogs ("WinPEBuilder_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
 }
-$script:LogFile = Join-Path $DirLogs ("WinPEBuilder_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+else {
+    $script:LogFile = $null
+}
 
 # --- console (respect -Quiet for WPF / host apps; always log to file) ---
 
@@ -474,6 +551,12 @@ function Invoke-AdkCommand {
         [string]$Name,
         [string]$WaitHint = ''
     )
+    Assert-NoCmdMetacharacters -Value $WorkDirectory -ParameterName 'WorkDirectory'
+    Assert-NoCmdMetacharacters -Value $BootWimPath -ParameterName 'BootWimPath'
+    Assert-NoCmdMetacharacters -Value $EnvBat -ParameterName 'EnvBat'
+    Assert-NoCmdMetacharacters -Value $Tool -ParameterName 'Tool'
+    Assert-NoCmdMetacharacters -Value $Arguments -ParameterName 'Arguments'
+
     $cmd = 'call "{0}" && call "{1}" {2}' -f $EnvBat, $Tool, $Arguments
     Write-Log "Running $Name ..." -Level Step
     if ($WaitHint) { Write-Ui "   $WaitHint" 'DarkYellow' }
@@ -512,11 +595,56 @@ function Invoke-AdkCommand {
 
 function Invoke-DismOnImage {
     param([string]$MountPath, [string[]]$DismArgs, [string]$Name)
-    $argLine = (@("/Image:`"$MountPath`"") + $DismArgs) -join ' '
-    Write-Log "dism $Name ..." -Level Info
-    $p = Start-Process -FilePath dism.exe -ArgumentList $argLine -Wait -PassThru -NoNewWindow
-    if ($null -eq $p) { throw "dism $Name failed to start" }
-    if ($p.ExitCode -ne 0) { throw "dism $Name failed (exit $($p.ExitCode))" }
+    $cleanMount = $MountPath.Trim('"')
+    $quotedArgs = New-Object System.Collections.Generic.List[string]
+    [void]$quotedArgs.Add(('/Image:"{0}"' -f $cleanMount))
+    foreach ($a in @($DismArgs)) {
+        if ([string]::IsNullOrWhiteSpace($a)) { continue }
+        if ($a -match '^(/[^:]+):(.+)$') {
+            $opt = $Matches[1]
+            $val = $Matches[2].Trim('"')
+            if ($val -match '\s') {
+                [void]$quotedArgs.Add(('{0}:"{1}"' -f $opt, $val))
+            }
+            else {
+                [void]$quotedArgs.Add(('{0}:{1}' -f $opt, $val))
+            }
+        }
+        elseif ($a -match '\s' -and $a -notmatch '^".*"$') {
+            [void]$quotedArgs.Add(('"{0}"' -f $a.Trim('"')))
+        }
+        else {
+            [void]$quotedArgs.Add($a)
+        }
+    }
+    $argLine = $quotedArgs -join ' '
+    Write-Log "dism $Name ($argLine) ..." -Level Info
+    $tmpOut = [IO.Path]::GetTempFileName()
+    $tmpErr = [IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath 'dism.exe' -ArgumentList $argLine -Wait -PassThru -NoNewWindow `
+            -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+        foreach ($tmpFile in @($tmpOut, $tmpErr)) {
+            if ($tmpFile -and (Test-Path -LiteralPath $tmpFile)) {
+                foreach ($line in @(Get-Content -LiteralPath $tmpFile -ErrorAction SilentlyContinue)) {
+                    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                    Write-Ui "   | $line" 'DarkGray'
+                    if ($script:LogFile) {
+                        Add-Content -Path $script:LogFile -Value "  [dism] $line" -Encoding UTF8
+                    }
+                }
+            }
+        }
+        if ($null -eq $p) { throw "dism $Name failed to start" }
+        if ($p.ExitCode -ne 0) { throw "dism $Name failed (exit $($p.ExitCode))" }
+    }
+    finally {
+        foreach ($tmpFile in @($tmpOut, $tmpErr)) {
+            if ($tmpFile -and (Test-Path -LiteralPath $tmpFile)) {
+                Remove-Item -LiteralPath $tmpFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
 }
 
 # --- mounts ---
@@ -524,18 +652,73 @@ function Invoke-DismOnImage {
 function Get-ActiveMounts {
     $root = [IO.Path]::GetFullPath($DirPeRoot).TrimEnd('\')
     @(Get-WindowsImage -Mounted -ErrorAction SilentlyContinue) | Where-Object {
-        [IO.Path]::GetFullPath($_.Path).TrimEnd('\').StartsWith($root, [StringComparison]::OrdinalIgnoreCase)
+        $mPath = [IO.Path]::GetFullPath($_.Path).TrimEnd('\')
+        $mPath.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
+        $mPath.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)
     }
 }
 
 function Dismount-ProjectImage {
     param([switch]$Save)
-    foreach ($m in (Get-ActiveMounts)) {
+    $mounts = @(Get-ActiveMounts)
+    if ($mounts.Count -eq 0) { return }
+    foreach ($m in $mounts) {
         if ($Save) {
             Dismount-WindowsImage -Path $m.Path -Save -ErrorAction Stop | Out-Null
         }
         else {
-            Dismount-WindowsImage -Path $m.Path -Discard -ErrorAction SilentlyContinue | Out-Null
+            try {
+                Dismount-WindowsImage -Path $m.Path -Discard -ErrorAction Stop | Out-Null
+            }
+            catch {
+                Write-Log "Dismount-WindowsImage (-Discard) failed for '$($m.Path)': $($_.Exception.Message). Running Clear-WindowsCorruptMountPoint..." -Level Error
+                Clear-WindowsCorruptMountPoint -ErrorAction SilentlyContinue | Out-Null
+            }
+        }
+    }
+    $remaining = @(Get-ActiveMounts)
+    if ($remaining.Count -gt 0) {
+        $remPaths = ($remaining | ForEach-Object { $_.Path }) -join ', '
+        throw "Active WIM mount(s) remain under '$DirPeRoot' after dismount attempt: $remPaths"
+    }
+}
+
+function Assert-NoReparsePointsOrActiveMounts {
+    # Prevent recursive deletion of active WIM mount points or NTFS junctions/symlinks.
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+    $fullTarget = [IO.Path]::GetFullPath($LiteralPath).TrimEnd('\')
+    $activeMounts = @(Get-ActiveMounts)
+    if ($activeMounts.Count -gt 0) {
+        $mList = ($activeMounts | ForEach-Object { $_.Path }) -join ', '
+        throw "Refused recursive delete of '$fullTarget': active project WIM mount(s) detected ($mList)."
+    }
+    foreach ($m in @(Get-WindowsImage -Mounted -ErrorAction SilentlyContinue)) {
+        if (-not $m.Path) { continue }
+        $mPath = [IO.Path]::GetFullPath($m.Path).TrimEnd('\')
+        if ($mPath.Equals($fullTarget, [StringComparison]::OrdinalIgnoreCase) -or
+            $mPath.StartsWith($fullTarget + '\', [StringComparison]::OrdinalIgnoreCase) -or
+            $fullTarget.StartsWith($mPath + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refused recursive delete of '$fullTarget': overlaps active WIM mount '$mPath'."
+        }
+    }
+    if (-not (Test-Path -LiteralPath $fullTarget)) { return }
+    $rootItem = Get-Item -LiteralPath $fullTarget -Force -ErrorAction Stop
+    if ([bool]($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Refused recursive delete: reparse point detected at '$($rootItem.FullName)'."
+    }
+    if ($rootItem.PSIsContainer) {
+        $queue = New-Object System.Collections.Generic.Queue[string]
+        $queue.Enqueue($rootItem.FullName)
+        while ($queue.Count -gt 0) {
+            $curr = $queue.Dequeue()
+            foreach ($child in @(Get-ChildItem -LiteralPath $curr -Force -ErrorAction Stop)) {
+                if ([bool]($child.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    throw "Refused recursive delete of '$fullTarget': reparse point detected at '$($child.FullName)'."
+                }
+                if ($child.PSIsContainer) {
+                    $queue.Enqueue($child.FullName)
+                }
+            }
         }
     }
 }
@@ -545,9 +728,10 @@ function Clear-ProjectMount {
     Write-Log 'Clearing mounts...' -Level Step
     Dismount-ProjectImage
     if ($Global) { Clear-WindowsCorruptMountPoint -ErrorAction SilentlyContinue }
-    if (Test-Path $DirMount) {
-        Get-ChildItem $DirMount -Force -ErrorAction SilentlyContinue |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $DirMount) {
+        Assert-NoReparsePointsOrActiveMounts -LiteralPath $DirMount
+        Get-ChildItem -LiteralPath $DirMount -Force -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction Stop
     }
     Write-Log 'Mounts cleared.' -Level Ok
 }
@@ -560,14 +744,15 @@ function Mount-BootImage {
         return [IO.Path]::GetFullPath($open[0].Path).TrimEnd('\')
     }
 
-    if (-not (Test-Path $DirMount)) {
+    if (-not (Test-Path -LiteralPath $DirMount)) {
         New-Item -ItemType Directory -Path $DirMount -Force | Out-Null
     }
     else {
-        $leftover = @(Get-ChildItem $DirMount -Force -ErrorAction SilentlyContinue)
+        $leftover = @(Get-ChildItem -LiteralPath $DirMount -Force -ErrorAction SilentlyContinue)
         if ($leftover.Count -gt 0) {
             Write-Log 'Mount folder has leftover files; cleaning before remount...' -Level Warn
-            $leftover | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            Assert-NoReparsePointsOrActiveMounts -LiteralPath $DirMount
+            $leftover | Remove-Item -Recurse -Force -ErrorAction Stop
         }
     }
 
@@ -739,6 +924,40 @@ function Resolve-PackageListFilePath {
     return $null
 }
 
+function Assert-ValidPackageName {
+    # Enforce strict package basename allowlist to prevent path traversal outside OcRoot.
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if ($Name -notmatch '^[a-zA-Z0-9._-]+$' -or $Name -match '\.\.') {
+        throw "Invalid WinPE package name '$Name'. Package names must match '^[a-zA-Z0-9._-]+$' and cannot contain path separators or '..'."
+    }
+}
+
+function Assert-PathUnderRoot {
+    # Verify canonical path containment inside the expected root directory.
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Root
+    )
+    $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    if (-not $fullPath.StartsWith($fullRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Path traversal blocked: '$fullPath' is outside allowed root '$fullRoot'."
+    }
+    return $fullPath
+}
+
+function Write-ArtifactDigestLog {
+    # Log SHA-256 digest of external artifacts (boot.wim, drivers, updates) before injection.
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$Category
+    )
+    if (-not (Test-Path -LiteralPath $LiteralPath -PathType Leaf)) { return $null }
+    $hashObj = Get-FileHash -LiteralPath $LiteralPath -Algorithm SHA256 -ErrorAction Stop
+    Write-Log ("SHA-256 [{0}] {1} = {2}" -f $Category, $LiteralPath, $hashObj.Hash) -Level Info
+    return $hashObj.Hash
+}
+
 function Read-PackageListFile {
     param([string]$Path)
     $names = [System.Collections.Generic.List[string]]::new()
@@ -749,7 +968,10 @@ function Read-PackageListFile {
         if ($line.StartsWith('#')) { continue }
         # First token only (package basenames have no spaces in ADK cabs)
         $name = ($line -split '\s+')[0]
-        if ($name) { [void]$names.Add($name) }
+        if ($name) {
+            Assert-ValidPackageName -Name $name
+            [void]$names.Add($name)
+        }
     }
     return @($names)
 }
@@ -772,6 +994,7 @@ function Expand-AddPackageArguments {
             Write-Log "Package list file: $resolved ($($active.Count) active)" -Level Info
             foreach ($n in $active) {
                 if (-not $n) { continue }
+                Assert-ValidPackageName -Name $n
                 if ($seen.ContainsKey($n)) { continue }
                 $seen[$n] = $true
                 [void]$names.Add($n)
@@ -781,6 +1004,7 @@ function Expand-AddPackageArguments {
             throw "Package list file not found: $e (checked WorkDirectory and current location)"
         }
         else {
+            Assert-ValidPackageName -Name $e
             if ($seen.ContainsKey($e)) { continue }
             $seen[$e] = $true
             [void]$names.Add($e)
@@ -805,6 +1029,7 @@ function New-WinPeTree {
     if (Test-Path -LiteralPath $DirPeRoot) {
         Write-Log 'Removing old WinPE-Root before copype...' -Level Warn
         Dismount-ProjectImage
+        Assert-NoReparsePointsOrActiveMounts -LiteralPath $DirPeRoot
         Remove-Item -LiteralPath $DirPeRoot -Recurse -Force
     }
 
@@ -820,11 +1045,13 @@ function New-WinPeTree {
     }
 
     if ($BootWimPath) {
-        if (-not (Test-Path $BootWimPath)) { throw "Custom boot.wim not found: $BootWimPath" }
-        Copy-Item $BootWimPath $FileBootWim -Force
+        Assert-NoCmdMetacharacters -Value $BootWimPath -ParameterName 'BootWimPath'
+        if (-not (Test-Path -LiteralPath $BootWimPath -PathType Leaf)) { throw "Custom boot.wim not found: $BootWimPath" }
+        $null = Write-ArtifactDigestLog -LiteralPath $BootWimPath -Category 'BootWim'
+        Copy-Item -LiteralPath $BootWimPath -Destination $FileBootWim -Force
         Write-Log 'Custom boot.wim applied.' -Level Ok
     }
-    if (-not (Test-Path $FileBootWim)) { throw "copype done but boot.wim missing: $FileBootWim" }
+    if (-not (Test-Path -LiteralPath $FileBootWim)) { throw "copype done but boot.wim missing: $FileBootWim" }
     if (Get-ActiveMounts) { throw 'Unexpected mount still open. Run -Discard.' }
 
     Write-Done "WinPE tree ready at $DirPeRoot"
@@ -854,6 +1081,7 @@ function Add-OptionalPackages {
         # List file is the source of truth (active lines only; defaults not re-merged).
         foreach ($n in @($expanded.Names)) {
             if (-not $n -or $seen.ContainsKey($n)) { continue }
+            Assert-ValidPackageName -Name $n
             $seen[$n] = $true
             [void]$list.Add($n)
         }
@@ -862,12 +1090,14 @@ function Add-OptionalPackages {
         if (-not $NoDefaultPackages) {
             foreach ($n in $DefaultPackages) {
                 if ($seen.ContainsKey($n)) { continue }
+                Assert-ValidPackageName -Name $n
                 $seen[$n] = $true
                 [void]$list.Add($n)
             }
         }
         foreach ($n in @($expanded.Names)) {
             if (-not $n -or $seen.ContainsKey($n)) { continue }
+            Assert-ValidPackageName -Name $n
             $seen[$n] = $true
             [void]$list.Add($n)
         }
@@ -878,7 +1108,7 @@ function Add-OptionalPackages {
     # before Set-AllIntl runs later in the build.
     if ($Language -ne 'en-us') {
         $langRoot = Join-Path $OcRoot $Language
-        $mainLanguageCab = Join-Path $langRoot 'lp.cab'
+        $mainLanguageCab = Assert-PathUnderRoot -Path (Join-Path $langRoot 'lp.cab') -Root $OcRoot
         if (-not (Test-Path -LiteralPath $mainLanguageCab -PathType Leaf)) {
             throw "Main WinPE language pack not found: $mainLanguageCab"
         }
@@ -893,7 +1123,9 @@ function Add-OptionalPackages {
     $n = 0
     $skipped = 0
     foreach ($name in $list) {
-        $cab = Join-Path $OcRoot ($name + '.cab')
+        Assert-ValidPackageName -Name $name
+        $isMandatory = [bool]($script:MandatoryFoundationPackages | Where-Object { $_.Equals($name, [StringComparison]::OrdinalIgnoreCase) })
+        $cab = Assert-PathUnderRoot -Path (Join-Path $OcRoot ($name + '.cab')) -Root $OcRoot
         if (-not (Test-Path -LiteralPath $cab)) {
             # Case-insensitive match (e.g. PlatformId vs PlatformID)
             $hit = $null
@@ -903,11 +1135,14 @@ function Add-OptionalPackages {
                     Select-Object -First 1
             }
             if (-not $hit) {
+                if ($isMandatory) {
+                    throw "Mandatory foundation package not found in '$OcRoot': $name"
+                }
                 Write-Log "Package not found (skipped): $name" -Level Warn
                 $skipped++
                 continue
             }
-            $cab = $hit.FullName
+            $cab = Assert-PathUnderRoot -Path $hit.FullName -Root $OcRoot
             $name = $hit.BaseName
         }
 
@@ -917,19 +1152,24 @@ function Add-OptionalPackages {
         }
         catch {
             $errMsg = $_.Exception.Message
+            if ($isMandatory) {
+                throw "Mandatory foundation package install failed for '$name': $errMsg"
+            }
             Write-Log "Package install failed (skipped): $name - $errMsg" -Level Warn
             $skipped++
             continue
         }
 
-        $langCab = Join-Path $OcRoot (Join-Path $Language ($name + '_' + $Language + '.cab'))
+        $langCab = Assert-PathUnderRoot -Path (Join-Path $OcRoot (Join-Path $Language ($name + '_' + $Language + '.cab'))) -Root $OcRoot
         $langDir = Join-Path $OcRoot $Language
         if (-not (Test-Path -LiteralPath $langCab) -and (Test-Path -LiteralPath $langDir -PathType Container)) {
             $want = $name + '_' + $Language
             $langHit = Get-ChildItem -LiteralPath $langDir -Filter '*.cab' -File -ErrorAction SilentlyContinue |
                 Where-Object { $_.BaseName -eq $want } |
                 Select-Object -First 1
-            if ($langHit) { $langCab = $langHit.FullName }
+            if ($langHit) {
+                $langCab = Assert-PathUnderRoot -Path $langHit.FullName -Root $OcRoot
+            }
         }
         if (Test-Path -LiteralPath $langCab) {
             try {
@@ -954,10 +1194,14 @@ function Add-OptionalPackages {
 
 function Add-ProjectDrivers {
     param([string]$MountPath)
-    if (-not (Test-Path $DirDrivers)) { return 0 }
-    $infs = @(Get-ChildItem $DirDrivers -Recurse -Filter '*.inf' -ErrorAction SilentlyContinue)
+    if (-not (Test-Path -LiteralPath $DirDrivers)) { return 0 }
+    $infs = @(Get-ChildItem -LiteralPath $DirDrivers -Recurse -Filter '*.inf' -File -ErrorAction SilentlyContinue)
     if ($infs.Count -eq 0) { return 0 }
+    $cats = @(Get-ChildItem -LiteralPath $DirDrivers -Recurse -Filter '*.cat' -File -ErrorAction SilentlyContinue)
     Write-Log "Adding drivers ($($infs.Count))..." -Level Step
+    foreach ($drvFile in @($infs + $cats)) {
+        $null = Write-ArtifactDigestLog -LiteralPath $drvFile.FullName -Category 'Driver'
+    }
     Add-WindowsDriver -Path $MountPath -Driver $DirDrivers -Recurse -ErrorAction Stop | Out-Null
     Write-Log "Drivers: $($infs.Count)" -Level Ok
     return $infs.Count
@@ -965,7 +1209,7 @@ function Add-ProjectDrivers {
 
 function Copy-ProjectScripts {
     param([string]$MountPath)
-    if (-not (Test-Path $DirScripts)) { return }
+    if (-not (Test-Path -LiteralPath $DirScripts)) { return }
     Write-Log 'Copying scripts...' -Level Step
     $sys32 = Join-Path $MountPath 'Windows\System32'
     $copied = 0
@@ -976,18 +1220,32 @@ function Copy-ProjectScripts {
             @{ Src = 'Media'; Dst = $DirMedia; Label = 'Media -> boot media' }
         )) {
         $srcPath = Join-Path $DirScripts $map.Src
-        if (-not (Test-Path $srcPath)) { continue }
-        $items = @(Get-ChildItem $srcPath -Force -ErrorAction SilentlyContinue)
+        if (-not (Test-Path -LiteralPath $srcPath)) { continue }
+        $items = @(Get-ChildItem -LiteralPath $srcPath -Force -ErrorAction SilentlyContinue)
         if ($items.Count -eq 0) { continue }
         Copy-Item (Join-Path $srcPath '*') $map.Dst -Recurse -Force
         $copied += $items.Count
         Write-Log "  $($map.Label) ($($items.Count) item(s))" -Level Info
     }
 
+    # Copy root-level files in Add-Scripts\ (excluding special files and subdirectories) into Windows\System32.
+    $specialRootFiles = @('startnet.cmd', 'winpe.jpg', 'unattend.xml')
+    $rootFiles = @(
+        Get-ChildItem -LiteralPath $DirScripts -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $specialRootFiles -notcontains $_.Name.ToLowerInvariant() }
+    )
+    foreach ($rf in $rootFiles) {
+        Copy-Item -LiteralPath $rf.FullName -Destination (Join-Path $sys32 $rf.Name) -Force
+        $copied++
+    }
+    if ($rootFiles.Count -gt 0) {
+        Write-Log "  Add-Scripts root files -> System32 ($($rootFiles.Count) item(s))" -Level Info
+    }
+
     foreach ($n in @('Startnet.cmd', 'startnet.cmd')) {
         $src = Join-Path $DirScripts $n
-        if (Test-Path $src) {
-            Copy-Item $src (Join-Path $sys32 'Startnet.cmd') -Force
+        if (Test-Path -LiteralPath $src) {
+            Copy-Item -LiteralPath $src -Destination (Join-Path $sys32 'Startnet.cmd') -Force
             Write-Log '  startnet.cmd applied' -Level Info
             $copied++
             break
@@ -995,22 +1253,30 @@ function Copy-ProjectScripts {
     }
 
     $bg = Join-Path $DirScripts 'winpe.jpg'
-    if (Test-Path $bg) {
+    if (Test-Path -LiteralPath $bg) {
         $dest = Join-Path $sys32 'winpe.jpg'
-        if (Test-Path $dest) {
-            $own = Start-Process takeown.exe -ArgumentList @('/f', $dest, '/a') -Wait -PassThru -NoNewWindow
-            if ($own.ExitCode -ne 0) { throw "takeown failed for winpe.jpg (exit $($own.ExitCode))" }
-            $acl = Start-Process icacls.exe -ArgumentList @($dest, '/grant', 'Administrators:F') -Wait -PassThru -NoNewWindow
-            if ($acl.ExitCode -ne 0) { throw "icacls failed for winpe.jpg (exit $($acl.ExitCode))" }
+        if (Test-Path -LiteralPath $dest) {
+            $ownArgs = '/f "{0}" /a' -f $dest
+            $own = Start-Process -FilePath 'takeown.exe' -ArgumentList $ownArgs -Wait -PassThru -NoNewWindow
+            if ($null -eq $own -or $own.ExitCode -ne 0) {
+                $code = if ($null -ne $own) { $own.ExitCode } else { -1 }
+                throw "takeown failed for winpe.jpg (exit $code)"
+            }
+            $aclArgs = '"{0}" /grant "*S-1-5-32-544:F"' -f $dest
+            $acl = Start-Process -FilePath 'icacls.exe' -ArgumentList $aclArgs -Wait -PassThru -NoNewWindow
+            if ($null -eq $acl -or $acl.ExitCode -ne 0) {
+                $code = if ($null -ne $acl) { $acl.ExitCode } else { -1 }
+                throw "icacls failed for winpe.jpg (exit $code)"
+            }
         }
-        Copy-Item $bg $dest -Force
+        Copy-Item -LiteralPath $bg -Destination $dest -Force
         Write-Log '  winpe.jpg background applied' -Level Ok
         $copied++
     }
 
     $ua = Join-Path $DirScripts 'unattend.xml'
-    if (Test-Path $ua) {
-        Copy-Item $ua (Join-Path $DirMedia 'unattend.xml') -Force
+    if (Test-Path -LiteralPath $ua) {
+        Copy-Item -LiteralPath $ua -Destination (Join-Path $DirMedia 'unattend.xml') -Force
         Write-Log '  unattend.xml -> media' -Level Info
         $copied++
     }
@@ -1025,13 +1291,14 @@ function Copy-ProjectScripts {
 
 function Add-ProjectUpdates {
     param([string]$MountPath)
-    if (-not (Test-Path $DirUpdates)) { return 0 }
-    $files = @(Get-ChildItem $DirUpdates -Recurse -File -ErrorAction SilentlyContinue |
+    if (-not (Test-Path -LiteralPath $DirUpdates)) { return 0 }
+    $files = @(Get-ChildItem -LiteralPath $DirUpdates -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Extension -match '^\.(msu|cab)$' })
     if ($files.Count -eq 0) { return 0 }
 
     Write-Log "Adding updates ($($files.Count))..." -Level Step
     foreach ($f in $files) {
+        $null = Write-ArtifactDigestLog -LiteralPath $f.FullName -Category 'Update'
         Write-Log "  $($f.Name)" -Level Info
         Add-WindowsPackage -Path $MountPath -PackagePath $f.FullName -ErrorAction Stop | Out-Null
     }
@@ -1071,11 +1338,11 @@ function Set-ImageRegionalSettings {
 
 function New-WinPeIso {
     param($Adk)
-    if (-not (Test-Path $DirIso)) {
+    if (-not (Test-Path -LiteralPath $DirIso)) {
         New-Item -ItemType Directory -Path $DirIso -Force | Out-Null
     }
     $iso = Join-Path $DirIso ("WinPE_{0}_{1:yyyyMMdd_HHmm}.iso" -f $Architecture, (Get-Date))
-    if ((Test-Path $iso) -and -not $Force) { throw "ISO exists. Use -Force: $iso" }
+    if ((Test-Path -LiteralPath $iso) -and -not $Force) { throw "ISO exists. Use -Force: $iso" }
 
     $argstring = '/ISO'
     if ($Force) { $argstring += ' /f' }
@@ -1094,16 +1361,25 @@ function New-WinPeIso {
 
 function New-WinPeUsb {
     param($Adk)
-    $letter = $USB.Substring(0, 1).ToUpper()
-    $sys = if ($env:SystemDrive) { $env:SystemDrive.Substring(0, 1).ToUpper() } else { 'C' }
+    $letter = $USB.Substring(0, 1).ToUpperInvariant()
+    $sys = if ($env:SystemDrive) { $env:SystemDrive.Substring(0, 1).ToUpperInvariant() } else { 'C' }
     if ($letter -eq $sys) { throw "Refused: system drive ${letter}:" }
 
     $part = Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue
     if (-not $part) { throw "Drive not found: ${letter}:" }
     $disk = Get-Disk -Number $part.DiskNumber -ErrorAction Stop
     if ($disk.IsBoot -or $disk.IsSystem) { throw "Refused: boot/system disk $($disk.Number)" }
+    if ($disk.IsOffline) { throw "Refused: disk $($disk.Number) is offline" }
+    if ($disk.IsReadOnly) { throw "Refused: disk $($disk.Number) is read-only" }
     if ($disk.BusType -ne 'USB') { throw "Refused: bus is $($disk.BusType), not USB" }
+    $maxUsbBytes = 32GB
+    if ($disk.Size -gt $maxUsbBytes) {
+        throw ("Refused: USB disk {0} is {1:N1} GB (> 32 GB FAT32 limit for MakeWinPEMedia /UFD)." -f $disk.Number, ($disk.Size / 1GB))
+    }
     if ($PCA2023) { Test-BootExSupport -Adk $Adk }
+
+    $diskIdentity = "Number=$($disk.Number) FriendlyName='$($disk.FriendlyName)' SerialNumber='$($disk.SerialNumber)' UniqueId='$($disk.UniqueId)' Size=$($disk.Size) PartitionStyle='$($disk.PartitionStyle)'"
+    Write-Log "Target USB disk identity: $diskIdentity" -Level Info
 
     Write-Phase 'Create USB' ("Drive {0}:  Disk {1}  {2:N1} GB  (WILL FORMAT)" -f $letter, $disk.Number, ($disk.Size / 1GB))
     $argstring = '/UFD /f "{0}" {1}:' -f $DirPeRoot, $letter
@@ -1213,9 +1489,13 @@ if ($null -eq $adk) { $adk = Get-AdkInfo }
 $isoPath = $null
 $usbPath = $null
 $pkgN = 0; $drvN = 0; $updN = 0
+$buildMountedImage = $false
 
 try {
     if ($Clean -and -not $Mount -and -not $Build) {
+        if (-not $PSCmdlet.ShouldProcess($DirMount, 'Clean project mounts')) {
+            return New-BuildResult -Ok $true -Action 'Clean'
+        }
         Write-Phase 'Clean mounts' $(if ($Force) { 'Including global DISM cleanup' } else { 'Project mounts only' })
         Clear-ProjectMount -Global:$Force
         Write-Done 'Mounts cleaned'
@@ -1223,6 +1503,9 @@ try {
     }
 
     if ($Discard) {
+        if (-not $PSCmdlet.ShouldProcess($DirMount, 'Discard active mount')) {
+            return New-BuildResult -Ok $true -Action 'Discard'
+        }
         Write-Phase 'Discard mount' 'Drops uncommitted changes'
         Clear-ProjectMount
         Write-Done 'Changes discarded; not mounted'
@@ -1230,14 +1513,24 @@ try {
     }
 
     if ($Init) {
-        New-WinPeTree -Adk $adk
-        if (-not $Mount -and -not $Build) {
-            return New-BuildResult -Ok $true -Action 'Init' -Mounted $false
+        if (-not $PSCmdlet.ShouldProcess($WorkDirectory, 'Initialize WinPE project tree')) {
+            if (-not $Mount -and -not $Build) {
+                return New-BuildResult -Ok $true -Action 'Init' -Mounted $false
+            }
+        }
+        else {
+            New-WinPeTree -Adk $adk
+            if (-not $Mount -and -not $Build) {
+                return New-BuildResult -Ok $true -Action 'Init' -Mounted $false
+            }
         }
     }
 
     if ($Save -and -not $Build -and -not $Mount) {
         if (-not (Get-ActiveMounts)) { throw 'Nothing mounted. Run -Mount or -Build first.' }
+        if (-not $PSCmdlet.ShouldProcess($DirMount, 'Save and dismount boot.wim')) {
+            return New-BuildResult -Ok $true -Action 'Save' -Mounted $true
+        }
         Write-Phase 'Save image' 'Unmount and keep changes'
         Dismount-ProjectImage -Save
         Write-Done 'Image saved and unmounted'
@@ -1245,6 +1538,9 @@ try {
     }
 
     if ($Mount -and -not $Build) {
+        if (-not $PSCmdlet.ShouldProcess($FileBootWim, "Mount boot.wim to $DirMount")) {
+            return New-BuildResult -Ok $true -Action 'Mount' -Mounted ([bool](Get-ActiveMounts))
+        }
         if ($Clean) { Clear-ProjectMount }
         $null = Mount-BootImage
         Write-Host "Edit files in: $DirMount" -ForegroundColor Cyan
@@ -1254,6 +1550,9 @@ try {
     }
 
     if ($Build) {
+        if (-not $PSCmdlet.ShouldProcess($WorkDirectory, $actionName)) {
+            return New-BuildResult -Ok $true -Action 'Build' -Mounted ([bool](Get-ActiveMounts))
+        }
         if ($Clean) { Clear-ProjectMount }
         if (-not (Test-TimeZoneId -Name $TimeZone)) {
             throw "Unknown time zone '$TimeZone'. List valid IDs with: tzutil /l"
@@ -1266,7 +1565,11 @@ try {
 
         Write-Phase 'Build customization' 'Packages, drivers, scripts, updates'
         Write-Log "Language=$Language TimeZone='$TimeZone' ScratchSpace=${ScratchSpace}MB PCA2023=$PCA2023" -Level Info
+        $wasAlreadyMounted = (@(Get-ActiveMounts).Count -gt 0)
         $mountPath = Mount-BootImage
+        if (-not $wasAlreadyMounted) {
+            $buildMountedImage = $true
+        }
         Set-ImageScratchSpace -MountPath $mountPath -SizeMB $ScratchSpace
         $pkgN = Add-OptionalPackages -MountPath $mountPath -OcRoot $adk.OcRoot
         Set-ImageRegionalSettings -MountPath $mountPath
@@ -1278,13 +1581,19 @@ try {
         if ($ISO -or $USB -or $Save) {
             Write-Phase 'Commit image' 'Saving changes into boot.wim'
             Dismount-WindowsImage -Path $mountPath -Save -ErrorAction Stop | Out-Null
+            $buildMountedImage = $false
             Write-Log 'Image committed.' -Level Ok
         }
 
-        if ($ISO) { $isoPath = New-WinPeIso -Adk $adk }
-        if ($USB) { $usbPath = New-WinPeUsb -Adk $adk }
+        if ($ISO -and $PSCmdlet.ShouldProcess($DirIso, 'Create WinPE ISO')) {
+            $isoPath = New-WinPeIso -Adk $adk
+        }
+        if ($USB -and $PSCmdlet.ShouldProcess("USB Drive $USB", 'Format and create WinPE USB')) {
+            $usbPath = New-WinPeUsb -Adk $adk
+        }
 
         if (-not ($ISO -or $USB -or $Save)) {
+            $buildMountedImage = $false
             Write-Done 'Build applied; image still mounted (use -Save when ready)'
         }
         else {
@@ -1298,10 +1607,20 @@ try {
         -Mounted ([bool](Get-ActiveMounts)) -Pkgs $pkgN -Drvs $drvN -Upds $updN
 }
 catch {
+    $primaryErr = $_.Exception.Message
     Write-Host ''
     Write-Host 'FAILED' -ForegroundColor Red
-    Write-Log $_.Exception.Message -Level Error
+    Write-Log $primaryErr -Level Error
     if ($_.ScriptStackTrace) { Write-Log $_.ScriptStackTrace -Level Error }
+    if ($Build -and $buildMountedImage) {
+        Write-Log 'Build failed after mounting boot.wim; discarding uncommitted mount...' -Level Warn
+        try {
+            Dismount-ProjectImage
+        }
+        catch {
+            Write-Log "Automatic discard after build failure encountered an error: $($_.Exception.Message)" -Level Error
+        }
+    }
     $isMounted = $false
     try { $isMounted = [bool](Get-ActiveMounts) } catch { }
     Write-Host ''
@@ -1310,5 +1629,5 @@ catch {
         Write-Host 'Image may still be mounted. Run -Discard if needed.' -ForegroundColor Yellow
     }
     Write-Host ''
-    return New-BuildResult -Ok $false -Action 'Failed' -Err $_.Exception.Message -Mounted $isMounted
+    return New-BuildResult -Ok $false -Action 'Failed' -Err $primaryErr -Mounted $isMounted
 }
